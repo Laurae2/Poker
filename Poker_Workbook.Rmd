@@ -1,0 +1,615 @@
+---
+title: "Poker"
+author: "Laurae"
+date: "July 22, 2016"
+output: 
+  html_document: 
+    number_sections: yes
+    toc: yes
+    toc_depth: 4
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Objective of the Poker project
+
+There are several objectives on the Poker project:
+
+* Learn how to perform a proper Feature Engineering using domain knowledge, yielding the highest performance boost alone (from 0.63 to 0.85)
+* Learn how to use Artificial Intelligence / Supervised Machine Learning models
+* Tune hyperparameters on Extreme Gradient Boosting
+* Make an ensemble of models on a quite stable but against a private scoring method (public being available as 1-feedback)
+* Show what the hell you may think about when you see magic numbers showing out of nowhere (in the ensemble)
+* Learn to manage time in a project where data is already provided but not the appropriate features (70% of time spent in feature engineering, 30% modeling)
+
+This requires the following:
+
+* Setting up appropriately the working directory
+* Having the solutions to score your model(s) (if the online server is not available, or if Laurae is not available)
+* Having the training (200,000 samples) and testing (1,000,000 samples) datasets
+* Enough RAM (minimal is 4GB, recommended is 8+GB - insert gc() if you want happen to run out of memory!)
+
+Notes:
+
+* Debug/Verbose information were kept intentionally.
+* The h2o results may differ depending the multithreading (deterministic computation), so does XGBoost (both in version/determinism) - your mileage may vary, and so does the final results (along with magic numbers not working well!).
+* gc() information are provided if you want to estimate RAM usage.
+
+# Parts of this workbook
+
+* Packages loading
+* Data loading
+* Feature Engineering
+* AUC computation
+* Extreme Gradient Boosting
+* h2o cluster initizalization
+* h2o's Random Forest
+* h2o's Gradient Boosted Machines
+* h2o's Deep Learning / Multi-Layer Perceptron
+* h2o cluster kill
+* Ensemble by powering
+
+## Data preparation
+
+* Packages loading
+* Data loading
+* Feature Engineering
+
+### Load packages
+
+Load 4 packages:
+
+* data.table to read files ultra fast
+* R.utils to time the feature engineering method
+* xgboost to use Extreme Gradient Boosting learning model
+* h2o to use Random Forest, Gradient Boosted Machine, and Deep Learning (Multi-Layer Perceptron)
+
+```{r library}
+library(data.table) #data input
+library(R.utils) #timing
+library(xgboost) #learning using Extreme Gradient Boosting
+library(h2o) #learning using Random Forests
+```
+
+
+### Load data
+
+Load train, test, submission, and merge train/test to parse them together
+
+```{r data}
+# Load data and set working directory
+
+setwd("C:/Users/Laurae/Documents/Laurae Education/Machine Learning/Poker Data")
+train <- as.data.frame(fread("train.csv", header = TRUE, sep = ","))
+test <- as.data.frame(fread("test.csv", header = TRUE, sep = ","))
+#submission <- as.data.frame(fread("sample_submission.csv", header = TRUE, sep = ","))$Win
+submission <- as.data.frame(fread("solutions.csv", header = TRUE, sep = ","))$Win # This assumes you have the labeled test set
+
+# Merge train/test
+data <- rbind(train, cbind(test, Win = rep(-1, 1000000)))
+gc()
+```
+
+
+### Feature Engineering
+
+Create new features. Those who will be kept are the private and public combinations. They are merged on the full dataset and tagged whether they are public (using only community cards) or private (using both community and private cards).
+
+Features created:
+
+* Number: Amount of cards that are of a number in [1, 13], where in addition 14 is 1
+* Suit: Amount of cards that are of a suit in [1, 4]
+* Straights: Amount of cards that can fit in a serie of 5 consecutive numbers for a straight, from [1, 5] to [10, 14]
+* One pair: if a Number is equal to 2 (and if only, not a Three of a Kind or similar), then register a pair
+* Two pairs: if two Number are equal to 2 (and if only, not a triple pair or similar), then register a double pair
+* Three of a Kind: if a Number is equal to 3 (and if only, not a Four of a Kind or similar), then register a three of a kind
+* Straight: if a Straights is equal to 5, then register a straight
+* Flush: if a Suit is equal to 5 or higher, then register a flush
+* Full House: if a One pair + Two pairs is registered, then register a full house
+* Four of a Kind: if a Number is equal to 4 or higher, then register a four of a kind
+
+The data is then split back into train/test. 37 variables will remain at the end.
+
+```{r features}
+reCat <- function(input, rewrite, reline, init, verbose) {
+  
+  # input => text to print
+  # rewrite = erase the current line? (True/False)
+  # reline => add a line break?
+  # init = time to benchmark
+  # verbose = to print or not to print?
+  if (verbose == TRUE) {
+    cat(ifelse(rewrite, "\r", ""), "[", sprintf("%7.2f", (System$currentTimeMillis() - init) / 1000), " seconds]: ", input, ifelse(reline, "\n", ""), sep = "")
+  }
+  
+}
+
+CreateFeatures <- function(data, cards, suits, merge = TRUE, verbose = TRUE, tag = "") {
+  
+  # data => initial data (R x C)
+  # cards => number of the cards (R x n)
+  # suits => suits of the cards (R x n)
+  # merge => if TRUE, then merge all frames for debugging, else merge only available combinations
+  # verbose => if TRUE, print debugging information
+  
+  # create temporary frames
+  Card_Numbers <- data.frame(matrix(nrow = nrow(cards), ncol = 14))
+  colnames(Card_Numbers) <- paste("Number", 1:14, sep = "")
+  Card_Suits <- data.frame(matrix(nrow = nrow(cards), ncol = 4))
+  colnames(Card_Suits) <- paste("Suit", 1:4, sep = "")
+  Card_Straights <- data.frame(matrix(nrow = nrow(cards), ncol = 10))
+  colnames(Card_Straights) <- paste("Straight", 1:10, sep = "")
+  Card_Combos <- data.frame(matrix(nrow = nrow(cards), ncol = 7))
+  colnames(Card_Combos) <- c("1Pairs", "2Pairs", "3Kind", "Straight", "Flush", "FullHouse", "4Kind")
+  
+  time <- System$currentTimeMillis()
+  
+  # Check for number occurrences
+  for (i in 1:13) {
+    toPrint <- paste("Number ", i, sep = "")
+    reCat(input = toPrint, rewrite = FALSE, reline = FALSE, init = time, verbose = TRUE)
+    Card_Numbers[, paste("Number", i, sep = "")] <- apply(cards, 1, function(x) {sum(x == i)})
+    toPrint <- paste(toPrint, " done.", sep = "")
+    reCat(input = toPrint, rewrite = TRUE, reline = TRUE, init = time, verbose = TRUE)
+  }
+  # Add number 14 (Ace) for straight
+  toPrint <- paste("Number ", 14, sep = "")
+  reCat(input = toPrint, rewrite = FALSE, reline = FALSE, init = time, verbose = TRUE)
+  Card_Numbers[, paste("Number", 14, sep = "")] <- apply(cards, 1, function(x) {sum(x == 1)})
+  toPrint <- paste(toPrint, " done.", sep = "")
+  reCat(input = toPrint, rewrite = TRUE, reline = TRUE, init = time, verbose = TRUE)
+  
+  # Check for suit occurrences
+  for (i in 1:4) {
+    toPrint <- paste("Suit ", i, sep = "")
+    reCat(input = toPrint, rewrite = FALSE, reline = FALSE, init = time, verbose = TRUE)
+    Card_Suits[, paste("Suit", i, sep = "")] <- apply(suits, 1, function(x) {sum(x == i)})
+    toPrint <- paste(toPrint, " done.", sep = "")
+    reCat(input = toPrint, rewrite = TRUE, reline = TRUE, init = time, verbose = TRUE)
+  }
+  
+  # Check for straight occurrences
+  for (i in 1:10) {
+    toPrint <- paste("Straight ", i, "-", i+4, sep = "")
+    reCat(input = toPrint, rewrite = FALSE, reline = FALSE, init = time, verbose = TRUE)
+    Card_Straights[, paste("Straight", i, sep = "")] <- apply(Card_Numbers[, i + (0:4)], 1, function(x) {min(x[1], 1) + min(x[2], 1) + min(x[3], 1) + min(x[4], 1) + min(x[5], 1)})
+    toPrint <- paste(toPrint, " done.", sep = "")
+    reCat(input = toPrint, rewrite = TRUE, reline = TRUE, init = time, verbose = TRUE)
+  }
+  
+  # Find pairs
+  toPrint <- paste("1-Pair", sep = "")
+  reCat(input = toPrint, rewrite = FALSE, reline = FALSE, init = time, verbose = TRUE)
+  Card_Combos[, "1Pairs"] <- apply(Card_Numbers[, 1:13], 1, function(x) {min(sum(x == 2), 1)})
+  toPrint <- paste(toPrint, ": ", sum(Card_Combos[, "1Pairs"] == 1), sep = "")
+  reCat(input = toPrint, rewrite = TRUE, reline = TRUE, init = time, verbose = TRUE)
+
+  
+  # Find double pairs
+  toPrint <- paste("2-Pair", sep = "")
+  reCat(input = toPrint, rewrite = FALSE, reline = FALSE, init = time, verbose = TRUE)
+  Card_Combos[, "2Pairs"] <- apply(Card_Numbers[, 1:13], 1, function(x) {floor(min(sum(x == 2), 2)/2)})
+  toPrint <- paste(toPrint, ": ", sum(Card_Combos[, "2Pairs"] == 1), sep = "")
+  reCat(input = toPrint, rewrite = TRUE, reline = TRUE, init = time, verbose = TRUE)
+  
+  # Find three of a kind
+  toPrint <- paste("3-Kind", sep = "")
+  reCat(input = toPrint, rewrite = FALSE, reline = FALSE, init = time, verbose = TRUE)
+  Card_Combos[, "3Kind"] <- apply(Card_Numbers[, 1:13], 1, function(x) {min(sum(x == 3), 1)})
+  toPrint <- paste(toPrint, ": ", sum(Card_Combos[, "3Kind"] == 1), sep = "")
+  reCat(input = toPrint, rewrite = TRUE, reline = TRUE, init = time, verbose = TRUE)
+  
+  # Find straight
+  toPrint <- paste("Straight", sep = "")
+  reCat(input = toPrint, rewrite = FALSE, reline = FALSE, init = time, verbose = TRUE)
+  Card_Combos[, "Straight"] <- apply(Card_Straights, 1, function(x) {min(sum(x == 5), 1)})
+  toPrint <- paste(toPrint, ": ", sum(Card_Combos[, "Straight"] == 1), sep = "")
+  reCat(input = toPrint, rewrite = TRUE, reline = TRUE, init = time, verbose = TRUE)
+  
+  # Find flush
+  toPrint <- paste("Flush", sep = "")
+  reCat(input = toPrint, rewrite = FALSE, reline = FALSE, init = time, verbose = TRUE)
+  Card_Combos[, "Flush"] <- apply(Card_Suits, 1, function(x) {min(sum(x >= 5), 1)})
+  toPrint <- paste(toPrint, ": ", sum(Card_Combos[, "Flush"] == 1), sep = "")
+  reCat(input = toPrint, rewrite = TRUE, reline = TRUE, init = time, verbose = TRUE)
+  
+  # Find full house
+  toPrint <- paste("Full House", sep = "")
+  reCat(input = toPrint, rewrite = FALSE, reline = FALSE, init = time, verbose = TRUE)
+  Card_Combos[, "FullHouse"] <- floor((Card_Combos[, "1Pairs"] + Card_Combos[, "3Kind"])/2)
+  toPrint <- paste(toPrint, ": ", sum(Card_Combos[, "FullHouse"] == 1), sep = "")
+  reCat(input = toPrint, rewrite = TRUE, reline = TRUE, init = time, verbose = TRUE)
+  
+  # Find four of a kind
+  toPrint <- paste("4-Kind", sep = "")
+  reCat(input = toPrint, rewrite = FALSE, reline = FALSE, init = time, verbose = TRUE)
+  Card_Combos[, "4Kind"] <- apply(Card_Numbers[, 1:13], 1, function(x) {min(sum(x >= 4), 1)})
+  toPrint <- paste(toPrint, ": ", sum(Card_Combos[, "4Kind"] == 1), sep = "")
+  reCat(input = toPrint, rewrite = TRUE, reline = TRUE, init = time, verbose = TRUE)
+  
+  if (merge == TRUE) {
+    if (!(tag == "")) {
+      reCat(input = "Adding column tags", rewrite = FALSE, reline = TRUE, init = time, verbose = TRUE)
+      colnames(Card_Numbers) <- paste(colnames(Card_Numbers), tag, sep = "")
+      colnames(Card_Suits) <- paste(colnames(Card_Suits), tag, sep = "")
+      colnames(Card_Straights) <- paste(colnames(Card_Straights), tag, sep = "")
+      colnames(Card_Combos) <- paste(colnames(Card_Combos), tag, sep = "")
+    }
+    reCat(input = "Merging data frames", rewrite = FALSE, reline = FALSE, init = time, verbose = TRUE)
+    data <- cbind(data, Card_Numbers, Card_Suits, Card_Straights, Card_Combos)
+    reCat(input = "Merged data frames", rewrite = TRUE, reline = TRUE, init = time, verbose = TRUE)
+  } else {
+    if (!(tag == "")) {
+      reCat(input = "Adding column tags", rewrite = FALSE, reline = TRUE, init = time, verbose = TRUE)
+      colnames(Card_Combos) <- paste(colnames(Card_Combos), tag, sep = "")
+    }
+    reCat(input = "Merging data frames", rewrite = FALSE, reline = FALSE, init = time, verbose = TRUE)
+    data <- cbind(data, Card_Combos)
+    reCat(input = "Merged data frames", rewrite = TRUE, reline = TRUE, init = time, verbose = TRUE)
+  }
+  
+  return(data)
+  
+}
+
+data <- CreateFeatures(data, cards = data[, 2:8], suits = data[9:15], merge = TRUE, verbose = TRUE, tag = "_Private")
+data <- CreateFeatures(data, cards = data[, 4:8], suits = data[11:15], merge = TRUE, verbose = TRUE, tag = "_Public")
+
+train_enhanced <- data[1:200000, ]
+test_enhanced <- data[200001:1200000, -26]
+gc()
+```
+
+
+## Predictive modelization (Artificial Intelligence)
+
+* AUC computation
+* Extreme Gradient Boosting
+* h2o cluster initizalization
+* h2o's Random Forest
+* h2o's Gradient Boosted Machines
+* h2o's Deep Learning / Multi-Layer Perceptron
+* h2o cluster kill
+* Ensemble by powering
+
+
+### Add AUC computation
+
+Sometimes, AUC fails to run due to n1*n2 integers overflowing over the limit (approx. 2+bn).
+This chunk of code fixes it and computes AUC fast.
+
+```{r auc}
+
+# ~~~~ Setup fast AUC method
+# Handles n1*n2 out of bounds (integer overflow)
+
+FastAUC <- function(y, x) {
+  
+  # y = actual
+  # x = predicted
+  x1 = x[y==1]
+  n1 = as.numeric(length(x1))
+  x2 = x[y==0]
+  n2 = as.numeric(length(x2))
+  r = rank(c(x1,x2))
+  return((sum(r[1:n1]) - n1*(n1+1)/2) / (n1*n2))
+  
+}
+gc()
+```
+
+
+### XGBoost Model (best model)
+
+The following hyperparameters were used:
+
+* Depth: 5
+* Learning rate: 0.1
+* Iterations: 124
+* Everything else was left as is (or the default)
+
+This is the best model in the four models provided here. Only a fine-tuned ensemble is beating it in the private score.
+
+N.B: due to seed differences (h2O's seed, R's seed), results are not directly comparable although stable.
+
+Determinism may give different results over runs.
+
+Performance:
+
+* Stratified 5-fold CV score: 0.850154+0.002617
+* Public score: 0.8506203
+* Private score: 0.8503818
+
+
+```{r xgboost}
+# ~~~~ Prepare for XGBoost
+
+# Create datasets
+NotLearn <- c("Win", "id", "Big_Blind", paste("Number", 1:14, "_Private", sep = ""), paste("Number", 1:14, "_Public", sep = ""), paste("Suit", 1:4, "_Private", sep = ""), paste("Suit", 1:4, "_Public", sep = ""), paste("Straight", 1:10, "_Private", sep = ""), paste("Straight", 1:10, "_Public", sep = ""))
+train_temp <- xgb.DMatrix(data = data.matrix(train_enhanced[, !colnames(train_enhanced) %in% NotLearn]), label = data.matrix(train_enhanced$Win))
+test_temp <- xgb.DMatrix(data = data.matrix(test_enhanced[, !colnames(test_enhanced) %in% NotLearn]))
+
+# ~~ 5-fold Cross-Validation
+# [104]	train-auc:0.860366+0.000434	test-auc:0.850154+0.002617
+gc(verbose=FALSE)
+set.seed(11111)
+xgb.cv <- xgb.cv(data = train_temp,
+                 nthread = 2,
+                 nfold = 5,
+                 max.depth = 5,
+                 eta = 0.1,
+                 subsample = 1.00,
+                 colsample_bytree = 1.00,
+                 nrounds = 1000000,
+                 objective = "binary:logistic",
+                 eval_metric = "auc",
+                 verbose = TRUE,
+                 early.stop.round = 40,
+                 maximize = TRUE)
+
+# ~~ Train XGBoost
+# [124]	train-auc:0.860429
+gc(verbose=FALSE)
+set.seed(11111)
+xgb.train <- xgb.train(data = train_temp,
+                       nthread = 2,
+                       max.depth = 5,
+                       eta = 0.1,
+                       subsample = 1.00,
+                       colsample_bytree = 1.00,
+                       nrounds = 124,
+                       objective = "binary:logistic",
+                       eval_metric = "auc",
+                       verbose = TRUE,
+                       early.stop.round = 40,
+                       maximize = TRUE,
+                       watchlist = list(train = train_temp))
+
+# ~~ Debug information about XGBoost
+xgb.features <- xgb.importance(feature_names = colnames(train_enhanced)[!colnames(train_enhanced) %in% NotLearn], model = xgb.train)
+print(xgb.features, nrows = 999)
+
+# ~~ Test XGBoost on the test set
+# Public = 0.8506203
+# Private = 0.8503818
+xgb.predictions <- predict(xgb.train, test_temp)
+cat("Extreme Gradient Boosting performance\nPublic AUC: ", FastAUC(y = submission[1:100000], x = xgb.predictions[1:100000]), "\nPrivate AUC: ", FastAUC(y = submission[100001:1000000], x = xgb.predictions[100001:1000000]), "\n", sep = "")
+gc()
+```
+
+
+### h2o
+
+Initialize the h2o local server.
+
+The cluster is initialized with 2 threads if using the CRAN version.
+
+```{r h2o}
+h2o.init()
+train_h2o <- as.h2o(cbind(train_enhanced[, !colnames(train_enhanced) %in% NotLearn], Win = as.factor(train_enhanced$Win)))
+test_h2o <- as.h2o(test_enhanced[, !colnames(test_enhanced) %in% NotLearn])
+```
+
+
+#### Random Forest (h2o)
+
+The following hyperparameters were used:
+
+* Amount of trees for the bagged ensemble: 50
+* Depth: 10
+* Every other hyperparameters were left as is (default)
+
+This is not tuned and you may expect slightly better performance when tuned appropriately.
+
+Determinism may give different results over runs.
+
+Performance:
+
+* Stratified 5-fold CV score: 0.8473551 + 0.0015013177
+* Public score: 0.8473699
+* Private score: 0.8468554
+
+```{r rf}
+# ~~~ Random Forest
+
+# ~~ 5-fold Cross-Validation
+# auc 0.8473551 + 0.0015013177
+h2o.rf.cv <- h2o.randomForest(x = colnames(train_enhanced)[!colnames(train_enhanced) %in% NotLearn],
+                              y = "Win",
+                              training_frame = train_h2o,
+                              ntrees = 50,
+                              max_depth = 10,
+                              seed = 11111,
+                              nfolds = 5,
+                              fold_assignment = "Stratified",
+                              stopping_metric = "AUC")
+summary(h2o.rf.cv)
+
+# ~~ Test h2o Random Forest on the test set
+# Public = 0.8473699
+# Private = 0.8468554
+h2o.rf.predictions <- predict(h2o.rf.cv, test_h2o)
+h2o.rf.predictions <- as.data.frame(h2o.rf.predictions$p1)
+h2o.rf.predictions <- as.numeric(h2o.rf.predictions$p1)
+cat("Random Forest performance\nPublic AUC: ", FastAUC(y = submission[1:100000], x = h2o.rf.predictions[1:100000]), "\nPrivate AUC: ", FastAUC(y = submission[100001:1000000], x = h2o.rf.predictions[100001:1000000]), "\n", sep = "")
+gc()
+```
+
+
+#### Gradient Boosted Machine (h2o)
+
+The following hyperparameters were used:
+
+* Iterations for the boosted ensemble: 50
+* Depth: 5
+* Every other hyperparameters were left as is (default)
+
+This is not tuned and you may expect slightly better performance when tuned appropriately.
+
+Determinism may give different results over runs.
+
+Performance: 
+
+* Stratified 5-fold CV score: 0.84802705 + 0.0014191598
+* Public score: 0.8485799
+* Private score: 0.8485444
+
+```{r gbm}
+# ~~~ Gradient Boosted Machine
+
+# ~~ 5-fold Cross-Validation
+# auc 0.84802705 + 0.0014191598
+h2o.gbm.cv <- h2o.gbm(x = colnames(train_enhanced)[!colnames(train_enhanced) %in% NotLearn],
+                      y = "Win",
+                      training_frame = train_h2o,
+                      ntrees = 50,
+                      max_depth = 5,
+                      seed = 11111,
+                      nfolds = 5,
+                      score_each_iteration = TRUE,
+                      fold_assignment = "Stratified",
+                      stopping_metric = "AUC")
+summary(h2o.gbm.cv)
+
+# ~~ Test h2o Gradient Boosted Machine on the test set
+# Public = 0.8485799
+# Private = 0.8485444
+h2o.gbm.predictions <- predict(h2o.gbm.cv, test_h2o)
+h2o.gbm.predictions <- as.data.frame(h2o.gbm.predictions$p1)
+h2o.gbm.predictions <- as.numeric(h2o.gbm.predictions$p1)
+cat("Gradient Boosted Machine performance\nPublic AUC: ", FastAUC(y = submission[1:100000], x = h2o.gbm.predictions[1:100000]), "\nPrivate AUC: ", FastAUC(y = submission[100001:1000000], x = h2o.gbm.predictions[100001:1000000]), "\n", sep = "")
+gc()
+```
+
+
+#### Deep Learning / Multi-Layer Perceptron (h2o)
+
+The network used for the Multi-Layer Perceptron is the following:
+
+* Dense layer of 50 neurons (1850->1250 parameters)
+* Dense layer of 25 neurons (1250->250 parameters)
+* Dense layer of 10 neurons (250->10 parameters)
+* Total amount of parameters: 3360 (only...)
+* Every other hyperparameters were left as is (default)
+
+This is not tuned and you may expect slightly better performance when tuned appropriately.
+
+Determinism may give different results over runs.
+
+Performance:
+
+* Stratified 5-fold CV score: 0.8437943 + 0.0014553933
+* Public score: 0.8427155
+* Private score: 0.8432251
+
+```{r dl}
+# ~~~ Deep Learning (Dense layers: 50x25x10x1 => 37x50 + 50x25 + 25x10 + 10 => 1850+1250+250+10 = 3360 parameters)
+
+# ~~ 5-fold Cross-Validation
+# auc 0.8437943 + 0.0014553933
+h2o.dl.cv <- h2o.deeplearning(x = colnames(train_enhanced)[!colnames(train_enhanced) %in% NotLearn],
+                              y = "Win",
+                              training_frame = train_h2o,
+                              standardize = TRUE,
+                              activation = "Tanh",
+                              hidden = c(50, 25, 10),
+                              train_samples_per_iteration = -2,
+                              adaptive_rate = TRUE,
+                              loss = "CrossEntropy",
+                              score_interval = 10,
+                              score_training_samples = 0,
+                              score_validation_samples = 0,
+                              score_duty_cycle = 0.1,
+                              stopping_metric = "AUC",
+                              stopping_tolerance = 0.0000001,
+                              fast_mode = TRUE,
+                              seed = 11111,
+                              nfolds = 5,
+                              fold_assignment = "Stratified")
+summary(h2o.dl.cv)
+
+# ~~ Test h2o Gradient Boosted Machine on the test set
+# Public = 0.8427155
+# Private = 0.8432251
+h2o.dl.predictions <- predict(h2o.dl.cv, test_h2o)
+h2o.dl.predictions <- as.data.frame(h2o.dl.predictions$p1)
+h2o.dl.predictions <- as.numeric(h2o.dl.predictions$p1)
+cat("Deep Learning performance\nPublic AUC: ", FastAUC(y = submission[1:100000], x = h2o.dl.predictions[1:100000]), "\nPrivate AUC: ", FastAUC(y = submission[100001:1000000], x = h2o.dl.predictions[100001:1000000]), "\n", sep = "")
+gc()
+```
+
+
+#### Shutodwn h2o
+
+Kills the h2o cluster.
+
+```{r killer}
+# Shutdown h2o
+h2o.shutdown(prompt = FALSE)
+gc()
+```
+
+
+### Ensembling Method
+
+Uses the powering method created by your trainer. Typical non-AI ensembling methods (averaging, weighting...) are not working here.
+Your mileage may vary depending on the deterministic computations. The magic numbers on weights may not give a proper performance boost due to the variance per run.
+
+Previous best:
+
+* Public score: 0.8506203
+* Private score: 0.8503818
+
+Ensemble best without black magic numbers:
+
+* Public score: 0.8506915
+* Private score: 0.850382
+
+Ensemble best with black magic numbers:
+
+* Public score: 0.8504244
+* Private score: 0.8505212
+
+```{r ensemble}
+# ~~~~ Ensemble using the Powering method (reference method: Laurae)
+
+# ~~ Theoretical best (XGBoost)
+# Public = 0.8506203
+# Private = 0.8503818
+
+# ~~ Ensemble best with weights: better public, similar private
+# Public = 0.8506915
+# Private = 0.850382
+
+# ~~ Ensemble best with weights from magic numbers: lower public, higher private
+# Public = 0.8504244
+# Private = 0.8505212
+
+PowerPrediction <- function(preds, power, weight = rep(1, ncol(preds))) {
+  predicted <- rep(0, nrow(preds))
+  for (i in 1:ncol(preds)) {
+    predicted <- predicted + (weight[i] * (preds[[i]]^power) / sum(weight))
+  }
+  return(predicted)
+}
+
+df.predictions <- data.frame(XGBoost = xgb.predictions, h2o.rf = h2o.rf.predictions, h2o.gbm = h2o.gbm.predictions, h2o.dl = h2o.dl.predictions)
+ens.predictions <- PowerPrediction(df.predictions, power = 1, weight = c(1, 1, 1, 1))
+cat("Average performance\n Public AUC: ", FastAUC(y = submission[1:100000], x = ens.predictions[1:100000]), "\nPrivate AUC: ", FastAUC(y = submission[100001:1000000], x = ens.predictions[100001:1000000]), "\n\n", sep = "")
+ens.predictions <- PowerPrediction(df.predictions, power = 2, weight = c(1, 1, 1, 1))
+cat("Power [2] Average performance\n Public AUC: ", FastAUC(y = submission[1:100000], x = ens.predictions[1:100000]), "\nPrivate AUC: ", FastAUC(y = submission[100001:1000000], x = ens.predictions[100001:1000000]), "\n\n", sep = "")
+ens.predictions <- PowerPrediction(df.predictions, power = 4, weight = c(1, 1, 1, 1))
+cat("Power [4] Average performance\n Public AUC: ", FastAUC(y = submission[1:100000], x = ens.predictions[1:100000]), "\nPrivate AUC: ", FastAUC(y = submission[100001:1000000], x = ens.predictions[100001:1000000]), "\n\n", sep = "")
+ens.predictions <- PowerPrediction(df.predictions, power = 8, weight = c(1, 1, 1, 1))
+cat("Power [8] Average performance\n Public AUC: ", FastAUC(y = submission[1:100000], x = ens.predictions[1:100000]), "\nPrivate AUC: ", FastAUC(y = submission[100001:1000000], x = ens.predictions[100001:1000000]), "\n\n", sep = "")
+ens.predictions <- PowerPrediction(df.predictions, power = 16, weight = c(1, 1, 1, 1))
+cat("Power [16] Average performance\n Public AUC: ", FastAUC(y = submission[1:100000], x = ens.predictions[1:100000]), "\nPrivate AUC: ", FastAUC(y = submission[100001:1000000], x = ens.predictions[100001:1000000]), "\n\n", sep = "")
+ens.predictions <- PowerPrediction(df.predictions, power = 12, weight = c(16, 1, 2, 0))
+cat("Power Weighted Average performance\n Public AUC: ", FastAUC(y = submission[1:100000], x = ens.predictions[1:100000]), "\nPrivate AUC: ", FastAUC(y = submission[100001:1000000], x = ens.predictions[100001:1000000]), "\n\n", sep = "")
+ens.predictions <- PowerPrediction(df.predictions, power = 4, weight = c(14, -2.5, 2.5, 0.5)) # Magic numbers (black magic)
+cat("[Magic] Power Weighted Average performance\n Public AUC: ", FastAUC(y = submission[1:100000], x = ens.predictions[1:100000]), "\nPrivate AUC: ", FastAUC(y = submission[100001:1000000], x = ens.predictions[100001:1000000]), "\n\n", sep = "")
+gc()
+```
+
