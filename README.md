@@ -4,8 +4,11 @@ This is the source code for a solution scoring 0.85 on the Poker dataset.
 
 Please see the following link for the notebook with descriptions: https://rawgit.com/Laurae2/Poker/master/Poker_Workbook.html
 
-Features used: 37
-Computation time (i7-4600U, 16GB RAM): approx. 1 hour for 0.805-0.805 Public/Private LB (you can achieve 0.8506-0.8503 Public/Private LB in less than 10 minutes using the feature engineering and XGBoost alone)
+* Features used: 37
+* Computation time (i7-4600U, 16GB RAM): approx. 1 hour for 0.805-0.805 Public/Private LB (you can achieve 0.8506-0.8503 Public/Private LB in less than 10 minutes using the feature engineering and XGBoost alone)
+* Models used: Extreme Gradient Boosting, Random Forest, Gradient Boosted Machines, Deep Learning / MLP
+
+N.B: Power 4 Magic weighted models coming from a blackbox. Your mileage may vary due to computation determinism and multithreading.
 
    IA Model / Supervised ML   | 5-fold Cross-Validation | Public LB | Private LB
 ----------------------------- | ----------------------- | --------- | ----------
